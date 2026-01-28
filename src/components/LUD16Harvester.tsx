@@ -96,8 +96,12 @@ export function LUD16Harvester() {
 
     // Close subscription and pool
     if (poolRef.current && subIdRef.current) {
-      const relays = parseRelays(relayInput);
-      poolRef.current.close(relays);
+      try {
+        const relays = parseRelays(relayInput);
+        poolRef.current.close(relays);
+      } catch (error) {
+        console.error('Error closing pool:', error);
+      }
       poolRef.current = null;
       subIdRef.current = null;
     }
@@ -124,12 +128,29 @@ export function LUD16Harvester() {
       return;
     }
 
+    console.log('Starting harvest with relays:', relays);
+
     // Initialize relay statuses
     setRelayStatuses(relays.map(url => ({ url, status: 'connecting' })));
 
     // Create pool
-    const pool = new SimplePool();
-    poolRef.current = pool;
+    try {
+      const pool = new SimplePool();
+      poolRef.current = pool;
+      console.log('SimplePool created');
+    } catch (error) {
+      console.error('Failed to create SimplePool:', error);
+      setStatusMessage(`Error: Failed to initialize connection pool - ${error instanceof Error ? error.message : 'Unknown error'}`);
+      setRelayStatuses(relays.map(url => ({ 
+        url, 
+        status: 'error',
+        error: error instanceof Error ? error.message : 'Initialization failed'
+      })));
+      setIsRunning(false);
+      return;
+    }
+
+    const pool = poolRef.current;
 
     // Set up timeout
     timeoutIdRef.current = setTimeout(() => {
@@ -157,35 +178,107 @@ export function LUD16Harvester() {
 
     // Subscribe to kind 0 events
     try {
+      // Track if we've received any events to verify connections are working
+      let eventCount = 0;
+      const eventReceivedRef = { current: false };
+      const isRunningRef = { current: true }; // Track running state to avoid stale closures
+
       // Fix: subscribeMany expects a single Filter object, not an array
       const sub = pool.subscribeMany(
         relays,
         { kinds: [0], limit: 500 },
         {
           onevent: (event: NostrEvent) => {
+            eventCount++;
+            eventReceivedRef.current = true;
+            
+            // Update relay status to connected when we receive events
+            setRelayStatuses(prev =>
+              prev.map(r => ({ ...r, status: 'connected' }))
+            );
+            
             processEvent(event);
+            
+            // Update status message with event count
+            if (eventCount === 1) {
+              setStatusMessage(`Connected! Receiving events...`);
+            }
           },
           onclose: () => {
-            // Subscription closed
+            console.log('Subscription closed');
+            if (isRunningRef.current) {
+              setStatusMessage('Subscription closed - connection lost');
+              setRelayStatuses(prev =>
+                prev.map(r => {
+                  if (r.status === 'connected') {
+                    return { ...r, status: 'error', error: 'Connection closed' };
+                  }
+                  return r;
+                })
+              );
+            }
           },
           oneose: () => {
-            // End of stored events
+            console.log('End of stored events');
+            if (!eventReceivedRef.current && isRunningRef.current) {
+              // No events received, connections might have failed
+              setRelayStatuses(prev =>
+                prev.map(r => ({ 
+                  ...r, 
+                  status: 'error',
+                  error: 'No events received - check relay URLs'
+                }))
+              );
+              setStatusMessage('Warning: No events received. Check relay URLs or try different relays.');
+            } else if (eventReceivedRef.current) {
+              console.log(`Received ${eventCount} events before EOSE`);
+            }
           },
         }
       );
 
+      // Update running ref when component state changes
+      const updateRunningRef = () => {
+        isRunningRef.current = isRunning;
+      };
+      
+      // Store ref update function (we'll call this in stopHarvesting)
+      (sub as any).__isRunningRef = isRunningRef;
+
       subIdRef.current = 'active';
 
-      // Monitor relay connections
-      // Note: SimplePool doesn't expose relay connection status directly,
-      // so we'll update status based on events received
-      setTimeout(() => {
-        setRelayStatuses(prev =>
-          prev.map(r => ({ ...r, status: 'connected' }))
-        );
-      }, 2000);
+      // Monitor relay connections with timeout
+      // Update status after a delay, but mark as error if no events received
+      const connectionCheckTimeout = setTimeout(() => {
+        if (!eventReceivedRef.current && isRunningRef.current) {
+          setRelayStatuses(prev =>
+            prev.map(r => {
+              if (r.status === 'connecting') {
+                return { 
+                  ...r, 
+                  status: 'error',
+                  error: 'Connection timeout - no events received'
+                };
+              }
+              return r;
+            })
+          );
+          setStatusMessage('Warning: Connection timeout. Check relay URLs and network connection.');
+        }
+      }, 10000); // 10 second timeout
+
+      // Store timeout for cleanup
+      (sub as any).__connectionCheckTimeout = connectionCheckTimeout;
     } catch (error) {
+      console.error('Failed to start subscription:', error);
       setStatusMessage(`Error: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      setRelayStatuses(prev =>
+        prev.map(r => ({ 
+          ...r, 
+          status: 'error',
+          error: error instanceof Error ? error.message : 'Unknown error'
+        }))
+      );
       stopHarvesting();
     }
   };
